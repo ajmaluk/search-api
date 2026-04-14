@@ -2,20 +2,27 @@ import asyncio
 import hashlib
 import time
 import re
-from urllib.parse import quote_plus, urljoin, urlparse
+import logging
+from urllib.parse import quote_plus, urlparse, parse_qs, unquote
+from typing import Optional
 
 import httpx
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
 try:
     import trafilatura
     HAS_TRAFILATURA = True
 except ImportError:
     HAS_TRAFILATURA = False
+    logger.warning("trafilatura not installed - install with: pip install trafilatura")
 
-app = FastAPI(title="Free AI Search API", version="2.0")
+app = FastAPI(title="AI Search API", version="2.1", description="Web search API for AI chat applications")
 
 app.add_middleware(
     CORSMiddleware,
@@ -24,7 +31,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ─── In-memory cache ──────────────────────────────────────────────
+# ─── Cache ──────────────────────────────────────────────
 _cache: dict = {}
 CACHE_TTL = 300  # 5 minutes
 
@@ -40,408 +47,369 @@ def cache_set(key: str, data):
 def cache_key(*args) -> str:
     return hashlib.md5("|".join(str(a) for a in args).encode()).hexdigest()
 
-# ─── User-agent rotation ──────────────────────────────────────────
+# ─── Headers & UA Rotation ──────────────────────────────
 USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/123.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/122.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
 ]
-_ua_index = 0
+_ua_idx = 0
 
 def next_ua() -> str:
-    global _ua_index
-    ua = USER_AGENTS[_ua_index % len(USER_AGENTS)]
-    _ua_index += 1
+    global _ua_idx
+    ua = USER_AGENTS[_ua_idx % len(USER_AGENTS)]
+    _ua_idx += 1
     return ua
 
-def get_headers():
-    return {
+def get_headers(referer: Optional[str] = None) -> dict:
+    h = {
         "User-Agent": next_ua(),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate",
-        "DNT": "1",
-        "Connection": "keep-alive",
+        "Accept-Encoding": "gzip, deflate, br",
+        "DNT": "1", "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document", "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none", "Sec-Fetch-User": "?1",
     }
+    if referer: h["Referer"] = referer
+    return h
 
-# ─── Search engines ───────────────────────────────────────────────
+# ─── Search Functions ───────────────────────────────────
 
 async def search_duckduckgo(query: str, max_results: int = 8) -> list:
+    """DuckDuckGo HTML search - resilient parsing"""
     url = "https://html.duckduckgo.com/html/"
-    params = {"q": query, "b": "", "kl": "us-en"}
+    params = {"q": query, "kl": "us-en"}
+    results = []
+    
     try:
-        async with httpx.AsyncClient(timeout=12, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
             r = await client.post(url, data=params, headers=get_headers())
+            r.raise_for_status()
+        
         soup = BeautifulSoup(r.text, "html.parser")
-        results = []
-        for a in soup.select(".result__a"):
-            href = a.get("href", "")
-            # DDG wraps links, extract real URL
+        
+        for item in soup.select(".result__a, a.result__a, .links_main a"):
+            href = item.get("href", "")
+            # Unwrap DDG redirect
             if "uddg=" in href:
-                from urllib.parse import unquote, parse_qs
                 qs = parse_qs(urlparse(href).query)
                 href = unquote(qs.get("uddg", [""])[0])
-            title = a.get_text(strip=True)
-            snippet_el = a.find_parent(".result")
+            if not href or href.startswith(("/html", "https://duckduckgo.com", "javascript:")):
+                continue
+            
+            title = item.get_text(strip=True)
+            if not title: continue
+            
             snippet = ""
-            if snippet_el:
-                snip = snippet_el.select_one(".result__snippet")
-                snippet = snip.get_text(strip=True) if snip else ""
-            if href and href.startswith("http"):
-                results.append({"title": title, "url": href, "snippet": snippet, "source": "duckduckgo"})
-        return results[:max_results]
+            parent = item.find_parent(".result, div.result, .web-result")
+            if parent:
+                snip = parent.select_one(".result__snippet, .result__body")
+                if snip: snippet = snip.get_text(strip=True)
+            
+            results.append({"title": title, "url": href, "snippet": snippet[:300], "source": "duckduckgo"})
+            if len(results) >= max_results: break
+        return results
     except Exception as e:
+        logger.warning(f"DDG error: {e}")
         return []
-
 
 async def search_brave(query: str, max_results: int = 8) -> list:
-    """Brave Search (no API key needed for HTML endpoint)"""
+    """Brave Search - multiple selector fallbacks"""
     url = f"https://search.brave.com/search?q={quote_plus(query)}&source=web"
+    results = []
+    
     try:
-        async with httpx.AsyncClient(timeout=12, follow_redirects=True) as client:
-            r = await client.get(url, headers=get_headers())
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+            r = await client.get(url, headers=get_headers("https://search.brave.com"))
+            r.raise_for_status()
+        
         soup = BeautifulSoup(r.text, "html.parser")
-        results = []
-        for item in soup.select(".snippet"):
-            a = item.select_one("a.heading-serpresult")
-            if not a:
-                a = item.select_one("a")
-            if not a:
-                continue
+        
+        # Try multiple result patterns
+        for item in soup.select(".snippet, .result, [data-snippet], .search-result"):
+            a = item.select_one("a.heading-serpresult, a.result-header, a.title, a[href]")
+            if not a: continue
             href = a.get("href", "")
+            if not href or not href.startswith("http"): continue
+            
             title = a.get_text(strip=True)
-            snip_el = item.select_one(".snippet-description")
-            snippet = snip_el.get_text(strip=True) if snip_el else ""
-            if href and href.startswith("http"):
-                results.append({"title": title, "url": href, "snippet": snippet, "source": "brave"})
-        return results[:max_results]
-    except Exception:
+            if not title: continue
+            
+            snip = item.select_one(".snippet-description, .result-desc, [data-snippet]")
+            snippet = snip.get_text(strip=True) if snip else ""
+            
+            results.append({"title": title, "url": href, "snippet": snippet[:300], "source": "brave"})
+            if len(results) >= max_results: break
+        return results
+    except Exception as e:
+        logger.warning(f"Brave error: {e}")
         return []
-
 
 async def search_mojeek(query: str, max_results: int = 8) -> list:
-    """Mojeek – independent search engine, no rate limiting"""
+    """Mojeek - independent search engine"""
     url = f"https://www.mojeek.com/search?q={quote_plus(query)}"
+    results = []
+    
     try:
-        async with httpx.AsyncClient(timeout=12, follow_redirects=True) as client:
-            r = await client.get(url, headers=get_headers())
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+            r = await client.get(url, headers=get_headers("https://www.mojeek.com"))
+            r.raise_for_status()
+        
         soup = BeautifulSoup(r.text, "html.parser")
-        results = []
-        for li in soup.select("ul.results-standard li"):
-            a = li.select_one("a.title")
-            if not a:
-                continue
+        
+        for li in soup.select("ul.results-standard li, div.results li, .result"):
+            a = li.select_one("a.title, h2 a, .result-title a, a[href]")
+            if not a: continue
             href = a.get("href", "")
+            if not href or not href.startswith("http"): continue
+            
             title = a.get_text(strip=True)
-            snip_el = li.select_one("p.s")
-            snippet = snip_el.get_text(strip=True) if snip_el else ""
-            if href and href.startswith("http"):
-                results.append({"title": title, "url": href, "snippet": snippet, "source": "mojeek"})
-        return results[:max_results]
-    except Exception:
+            if not title: continue
+            
+            snip = li.select_one("p.s, .result-desc, .snippet")
+            snippet = snip.get_text(strip=True) if snip else ""
+            
+            results.append({"title": title, "url": href, "snippet": snippet[:300], "source": "mojeek"})
+            if len(results) >= max_results: break
+        return results
+    except Exception as e:
+        logger.warning(f"Mojeek error: {e}")
         return []
 
-
-async def search_news_hn(query: str, max_results: int = 8) -> list:
-    """Hacker News Algolia API – completely free, no key"""
+async def search_hn(query: str, max_results: int = 8) -> list:
+    """Hacker News via Algolia API - most reliable"""
     url = f"https://hn.algolia.com/api/v1/search?query={quote_plus(query)}&tags=story&hitsPerPage={max_results}"
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(url)
+        async with httpx.AsyncClient(timeout=12) as client:
+            r = await client.get(url, headers={"User-Agent": "search-api/2.1"})
+            r.raise_for_status()
         data = r.json()
         results = []
         for hit in data.get("hits", []):
+            title = hit.get("title", "")
+            if not title: continue
             url_ = hit.get("url") or f"https://news.ycombinator.com/item?id={hit.get('objectID')}"
             results.append({
-                "title": hit.get("title", ""),
-                "url": url_,
-                "snippet": f"Points: {hit.get('points',0)} | Comments: {hit.get('num_comments',0)}",
-                "source": "hackernews",
+                "title": title, "url": url_,
+                "snippet": f"▲{hit.get('points',0)} 💬{hit.get('num_comments',0)}",
+                "source": "hackernews"
             })
         return results
-    except Exception:
+    except Exception as e:
+        logger.warning(f"HN error: {e}")
         return []
-
 
 async def search_wikipedia(query: str, max_results: int = 3) -> list:
+    """Wikipedia API - official endpoint"""
     url = "https://en.wikipedia.org/w/api.php"
-    params = {
-        "action": "query",
-        "list": "search",
-        "srsearch": query,
-        "srlimit": max_results,
-        "format": "json",
-        "utf8": 1,
-        "origin": "*"
-    }
-
+    params = {"action": "query", "list": "search", "srsearch": query, "srlimit": max_results, "format": "json"}
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(url, params=params)
-
+        async with httpx.AsyncClient(timeout=12) as client:
+            r = await client.get(url, params=params, headers={"User-Agent": "search-api/2.1"})
+            r.raise_for_status()
         data = r.json()
         results = []
-
         for item in data.get("query", {}).get("search", []):
             title = item.get("title", "")
-            snippet_html = item.get("snippet", "")
-            snippet = BeautifulSoup(snippet_html, "html.parser").get_text()
-
-            wiki_url = f"https://en.wikipedia.org/wiki/{title.replace(' ', '_')}"
-
+            if not title: continue
+            snippet = BeautifulSoup(item.get("snippet", ""), "html.parser").get_text(strip=True)
             results.append({
                 "title": title,
-                "url": wiki_url,
-                "snippet": snippet,
+                "url": f"https://en.wikipedia.org/wiki/{title.replace(' ', '_')}",
+                "snippet": snippet[:300],
                 "source": "wikipedia"
             })
-
         return results
-
     except Exception as e:
+        logger.warning(f"Wikipedia error: {e}")
         return []
 
-
 async def search_reddit(query: str, max_results: int = 5) -> list:
-    """Reddit JSON search – no auth needed"""
+    """Reddit JSON API - requires proper UA"""
     url = f"https://www.reddit.com/search.json?q={quote_plus(query)}&sort=relevance&limit={max_results}"
+    headers = {"User-Agent": "search-api/2.1 by u/ai_search_bot", "Accept": "application/json"}
     try:
-        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
-            r = await client.get(url, headers={"User-Agent": "search-api/2.0"})
+        async with httpx.AsyncClient(timeout=12, follow_redirects=True) as client:
+            r = await client.get(url, headers=headers)
+            r.raise_for_status()
         data = r.json()
         results = []
         for post in data.get("data", {}).get("children", []):
             d = post["data"]
+            title, permalink = d.get("title", ""), d.get("permalink", "")
+            if not title or not permalink: continue
+            text = d.get("selftext", "") or (d.get("preview", {}).get("text", [""])[0] if isinstance(d.get("preview", {}).get("text"), list) else "")
             results.append({
-                "title": d.get("title", ""),
-                "url": f"https://reddit.com{d.get('permalink','')}",
-                "snippet": d.get("selftext", "")[:300],
-                "source": "reddit",
+                "title": title,
+                "url": f"https://reddit.com{permalink}",
+                "snippet": text[:300] if text else "",
+                "source": "reddit"
             })
         return results
-    except Exception:
+    except Exception as e:
+        logger.warning(f"Reddit error: {e}")
         return []
 
-# ─── Content extraction ───────────────────────────────────────────
+# ─── Content Scraping ───────────────────────────────────
 
 async def scrape_url(url: str, max_chars: int = 4000) -> dict:
+    """Extract main content with anti-bot detection"""
+    parsed = urlparse(url)
+    if parsed.scheme not in ["http", "https"]:
+        return {"url": url, "content": "", "method": "invalid", "ok": False}
+    
+    # Skip known anti-bot/CDN domains
+    if any(x in parsed.netloc.lower() for x in ["cloudflare", "akamai", "incapsula", "perimeterx"]):
+        return {"url": url, "content": "", "method": "blocked", "ok": False}
+    
     try:
-        async with httpx.AsyncClient(
-            timeout=15, follow_redirects=True,
-            headers=get_headers()
-        ) as client:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers=get_headers(url)) as client:
             r = await client.get(url)
-
+            r.raise_for_status()
         html = r.text
-
-        # Try trafilatura first (best quality)
+        
+        # Detect anti-bot pages
+        if any(x in html.lower() for x in ["just a moment", "checking your browser", "cloudflare", "access denied"]):
+            return {"url": url, "content": "", "method": "antibot", "ok": False}
+        
+        # Try trafilatura (best)
         if HAS_TRAFILATURA:
-            text = trafilatura.extract(
-                html,
-                include_comments=False,
-                include_tables=True,
-                no_fallback=False,
-            )
-            if text and len(text) > 100:
-                return {"url": url, "content": text[:max_chars], "method": "trafilatura", "ok": True}
-
-        # Fallback: BeautifulSoup paragraph extraction
+            try:
+                text = trafilatura.extract(html, include_comments=False, include_tables=True, favor_precision=True)
+                if text and len(text.strip()) > 100:
+                    return {"url": url, "content": text[:max_chars], "method": "trafilatura", "ok": True}
+            except: pass
+        
+        # BeautifulSoup fallback
         soup = BeautifulSoup(html, "html.parser")
-        for tag in soup(["script", "style", "noscript", "nav", "footer", "header", "aside"]):
+        for tag in soup(["script", "style", "noscript", "nav", "footer", "header", "aside", "iframe"]):
             tag.decompose()
-
-        # Try article/main first
-        main = soup.find("article") or soup.find("main") or soup.find(id=re.compile(r"content|main|article", re.I))
-        container = main if main else soup
-
-        paragraphs = [p.get_text(strip=True) for p in container.find_all("p") if len(p.get_text(strip=True)) > 40]
-        text = "\n\n".join(paragraphs)
-
-        if len(text) < 100:
-            text = soup.get_text(separator="\n", strip=True)
-            text = re.sub(r'\n{3,}', '\n\n', text)
-
-        return {"url": url, "content": text[:max_chars], "method": "beautifulsoup", "ok": True}
-
+        
+        # Find main content
+        container = soup.select_one("article, main, [role='main'], #content, .content, [itemprop='articleBody']") or soup
+        paragraphs = [p.get_text(strip=True) for p in container.find_all("p") if len(p.get_text(strip=True)) > 50]
+        text = "\n\n".join(paragraphs) or container.get_text(separator="\n", strip=True)
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        
+        if not text.strip():
+            return {"url": url, "content": "", "method": "empty", "ok": False}
+        return {"url": url, "content": text[:max_chars], "method": "bs4", "ok": True}
+        
+    except httpx.HTTPStatusError as e:
+        logger.warning(f"Scrape HTTP {e.status_code} for {url}")
+        return {"url": url, "content": "", "method": f"http_{e.status_code}", "ok": False}
     except Exception as e:
-        return {"url": url, "content": "", "method": "failed", "ok": False, "error": str(e)}
+        logger.warning(f"Scrape error for {url}: {e}")
+        return {"url": url, "content": "", "method": "failed", "ok": False, "error": str(e)[:100]}
 
+# ─── Utilities ──────────────────────────────────────────
 
 def deduplicate(results: list) -> list:
-    seen_domains = set()
-    seen_titles = set()
-    out = []
+    """Remove duplicates by domain + normalized title"""
+    seen, out = set(), []
     for r in results:
-        domain = urlparse(r["url"]).netloc
-        title_key = r["title"].lower()[:60]
-        if domain not in seen_domains and title_key not in seen_titles:
-            seen_domains.add(domain)
-            seen_titles.add(title_key)
+        if not r.get("url") or not r.get("title"): continue
+        domain = urlparse(r["url"]).netloc.lower()
+        title_norm = re.sub(r'[^a-z0-9]', '', r["title"].lower())[:40]
+        key = f"{domain}:{title_norm}"
+        if key not in seen:
+            seen.add(key)
             out.append(r)
     return out
 
-# ─── API Endpoints ────────────────────────────────────────────────
+# ─── API Endpoints ──────────────────────────────────────
 
 @app.get("/")
 def root():
     return {
-        "name": "Free AI Search API",
-        "version": "2.0",
+        "name": "AI Search API", "version": "2.1", "status": "ready",
+        "usage": "For AI chat: call /search?query=...&engines=ddg,hn,wiki&scrape=true",
+        "engines": ["ddg", "brave", "mojeek", "wiki", "hn", "reddit"],
         "endpoints": {
-            "/search": "Multi-engine web search + content extraction",
-            "/quick":  "Fast search (results only, no scraping)",
-            "/scrape": "Scrape a single URL",
-            "/news":   "Hacker News search",
-            "/wiki":   "Wikipedia search",
-            "/reddit": "Reddit search",
-        },
+            "/search": "Multi-engine + optional scraping",
+            "/quick": "Fast results only",
+            "/scrape": "Single URL extraction",
+            "/health": "Status check"
+        }
     }
-
 
 @app.get("/search")
 async def search(
-    query: str = Query(..., description="Search query"),
+    query: str = Query(..., min_length=1),
     max_results: int = Query(5, ge=1, le=20),
-    engines: str = Query("ddg,brave,mojeek", description="Comma-separated: ddg,brave,mojeek,wiki,hn,reddit"),
-    scrape: bool = Query(True, description="Extract page content"),
-    max_chars: int = Query(3000, ge=500, le=8000),
+    engines: str = Query("ddg,hn,wiki", description="Comma-separated: ddg,brave,mojeek,wiki,hn,reddit"),
+    scrape: bool = Query(True, description="Extract page content for AI context"),
+    max_chars: int = Query(2500, ge=500, le=6000, description="Max chars per scraped page"),
 ):
+    """Primary endpoint for AI chat integration"""
     ck = cache_key("search", query, max_results, engines, scrape)
     cached = cache_get(ck)
-    if cached:
-        return {**cached, "cached": True}
-
-    engine_list = [e.strip() for e in engines.split(",")]
-
+    if cached: return {**cached, "cached": True}
+    
+    engine_list = [e.strip().lower() for e in engines.split(",") if e.strip()]
+    engine_map = {
+        "ddg": search_duckduckgo, "brave": search_brave, "mojeek": search_mojeek,
+        "wiki": search_wikipedia, "hn": search_hn, "reddit": search_reddit,
+    }
+    
     tasks = []
-    if "ddg"    in engine_list: tasks.append(search_duckduckgo(query, max_results))
-    if "brave"  in engine_list: tasks.append(search_brave(query, max_results))
-    if "mojeek" in engine_list: tasks.append(search_mojeek(query, max_results))
-    if "wiki"   in engine_list: tasks.append(search_wikipedia(query, 3))
-    if "hn"     in engine_list: tasks.append(search_news_hn(query, max_results))
-    if "reddit" in engine_list: tasks.append(search_reddit(query, 5))
-
-    all_results_nested = await asyncio.gather(*tasks, return_exceptions=True)
-
-    # Merge and deduplicate
-    merged = []
-    for batch in all_results_nested:
-        if isinstance(batch, list):
-            merged.extend(batch)
-
+    for eng in engine_list:
+        if eng in engine_map:
+            limit = {"wiki": 3, "reddit": 5}.get(eng, max_results)
+            tasks.append(engine_map[eng](query, min(limit, max_results)))
+    
+    batches = await asyncio.gather(*tasks, return_exceptions=True)
+    merged = [r for batch in batches if isinstance(batch, list) for r in batch]
     merged = deduplicate(merged)[:max_results]
-
-    # Scrape content
+    
+    # Scrape for AI context
     if scrape and merged:
         scrape_tasks = [scrape_url(r["url"], max_chars) for r in merged]
-        contents = await asyncio.gather(*scrape_tasks)
+        contents = await asyncio.gather(*scrape_tasks, return_exceptions=True)
         for i, r in enumerate(merged):
-            r["content"] = contents[i].get("content", "")
-            r["scrape_ok"] = contents[i].get("ok", False)
-
-    result = {
-        "query": query,
-        "total": len(merged),
-        "results": merged,
-        "cached": False,
-    }
-    cache_set(ck, result)
-    return result
-
-
-@app.get("/quick")
-async def quick_search(
-    query: str = Query(...),
-    max_results: int = Query(10, ge=1, le=20),
-):
-    """Fast search without page scraping"""
-    ck = cache_key("quick", query, max_results)
-    cached = cache_get(ck)
-    if cached:
-        return {**cached, "cached": True}
-
-    results_nested = await asyncio.gather(
-        search_duckduckgo(query, max_results),
-        search_brave(query, max_results),
-        return_exceptions=True,
-    )
-    merged = []
-    for batch in results_nested:
-        if isinstance(batch, list):
-            merged.extend(batch)
-
-    merged = deduplicate(merged)[:max_results]
+            c = contents[i] if i < len(contents) and isinstance(contents[i], dict) else {}
+            r["content"] = c.get("content", "")
+            r["scrape_ok"] = c.get("ok", False)
+            r["scrape_method"] = c.get("method", "none")
+    
     result = {"query": query, "total": len(merged), "results": merged, "cached": False}
     cache_set(ck, result)
     return result
 
+@app.get("/quick")
+async def quick_search(query: str = Query(...), max_results: int = Query(10, ge=1, le=20)):
+    """Fast metadata-only search (no scraping)"""
+    ck = cache_key("quick", query, max_results)
+    cached = cache_get(ck)
+    if cached: return {**cached, "cached": True}
+    
+    results = await asyncio.gather(
+        search_duckduckgo(query, max_results),
+        search_hn(query, max_results),
+        return_exceptions=True
+    )
+    merged = deduplicate([r for batch in results if isinstance(batch, list) for r in batch])[:max_results]
+    result = {"query": query, "total": len(merged), "results": merged, "cached": False}
+    cache_set(ck, result)
+    return result
 
 @app.get("/scrape")
-async def scrape_endpoint(
-    url: str = Query(..., description="Full URL to scrape"),
-    max_chars: int = Query(5000, ge=500, le=10000),
-):
-    ck = cache_key("scrape", url)
+async def scrape_endpoint(url: str = Query(...), max_chars: int = Query(4000, ge=500, le=8000)):
+    """Scrape single URL for AI context"""
+    if urlparse(url).scheme not in ["http", "https"]:
+        return {"url": url, "content": "", "ok": False, "error": "http/https required"}
+    ck = cache_key("scrape", url, max_chars)
     cached = cache_get(ck)
-    if cached:
-        return {**cached, "cached": True}
+    if cached: return {**cached, "cached": True}
     result = await scrape_url(url, max_chars)
     cache_set(ck, result)
     return result
 
-
-@app.get("/news")
-async def news_search(
-    query: str = Query(...),
-    max_results: int = Query(10, ge=1, le=30),
-):
-    ck = cache_key("news", query, max_results)
-    cached = cache_get(ck)
-    if cached:
-        return {**cached, "cached": True}
-    results = await search_news_hn(query, max_results)
-    result = {"query": query, "total": len(results), "results": results}
-    cache_set(ck, result)
-    return result
-
-
-@app.get("/wiki")
-async def wiki_search(
-    query: str = Query(...),
-    max_results: int = Query(5, ge=1, le=10),
-    full_content: bool = Query(False),
-):
-    ck = cache_key("wiki", query, max_results, full_content)
-    cached = cache_get(ck)
-    if cached:
-        return {**cached, "cached": True}
-    results = await search_wikipedia(query, max_results)
-    if full_content and results:
-        tasks = [scrape_url(r["url"], 6000) for r in results]
-        contents = await asyncio.gather(*tasks)
-        for i, r in enumerate(results):
-            r["content"] = contents[i].get("content", "")
-    result = {"query": query, "total": len(results), "results": results}
-    cache_set(ck, result)
-    return result
-
-
-@app.get("/reddit")
-async def reddit_search(
-    query: str = Query(...),
-    max_results: int = Query(10, ge=1, le=25),
-):
-    ck = cache_key("reddit", query, max_results)
-    cached = cache_get(ck)
-    if cached:
-        return {**cached, "cached": True}
-    results = await search_reddit(query, max_results)
-    result = {"query": query, "total": len(results), "results": results}
-    cache_set(ck, result)
-    return result
-
-
 @app.get("/health")
 def health():
-    return {"status": "ok", "cache_entries": len(_cache)}
+    return {"status": "ok", "cache_entries": len(_cache), "version": "2.1"}
+
+# Run with: uvicorn main:app --host 0.0.0.0 --port 8000
