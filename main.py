@@ -165,24 +165,41 @@ async def search_news_hn(query: str, max_results: int = 8) -> list:
 
 
 async def search_wikipedia(query: str, max_results: int = 3) -> list:
-    """Wikipedia REST API – completely free"""
-    url = f"https://en.wikipedia.org/w/api.php"
+    url = "https://en.wikipedia.org/w/api.php"
     params = {
-        "action": "query", "list": "search", "srsearch": query,
-        "srlimit": max_results, "format": "json", "utf8": 1,
+        "action": "query",
+        "list": "search",
+        "srsearch": query,
+        "srlimit": max_results,
+        "format": "json",
+        "utf8": 1,
+        "origin": "*"
     }
+
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.get(url, params=params)
+
         data = r.json()
         results = []
+
         for item in data.get("query", {}).get("search", []):
-            title = item["title"]
-            snippet = BeautifulSoup(item.get("snippet", ""), "html.parser").get_text()
+            title = item.get("title", "")
+            snippet_html = item.get("snippet", "")
+            snippet = BeautifulSoup(snippet_html, "html.parser").get_text()
+
             wiki_url = f"https://en.wikipedia.org/wiki/{title.replace(' ', '_')}"
-            results.append({"title": title, "url": wiki_url, "snippet": snippet, "source": "wikipedia"})
+
+            results.append({
+                "title": title,
+                "url": wiki_url,
+                "snippet": snippet,
+                "source": "wikipedia"
+            })
+
         return results
-    except Exception:
+
+    except Exception as e:
         return []
 
 
