@@ -1,492 +1,349 @@
 """
-AI Search API v3.1 - Production Ready for AI Chat + Financial Queries
-✅ Fixed: Scraping encoding, all engine parsers, financial data detection, Render compatibility
+AI Search API v4.0 - Ultra Minimal & Robust
+✅ Scraping with proper encoding
+✅ Working search engines
+✅ Financial data support
 """
 import asyncio
 import hashlib
 import time
 import re
-import logging
 import json
-from urllib.parse import quote_plus, urlparse, parse_qs, unquote, urljoin
-from typing import Optional, List, Dict, Any, Union
+import logging
+from urllib.parse import quote_plus, urlparse, parse_qs, unquote
+from typing import Optional, List, Dict, Any
 from datetime import datetime
 
 import httpx
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, Query, HTTPException, status
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-# Configure logging for Render debugging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
-    handlers=[logging.StreamHandler()]
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
-# Optional dependencies with graceful fallback
 try:
     import trafilatura
     HAS_TRAFILATURA = True
 except ImportError:
     HAS_TRAFILATURA = False
-    logger.warning("trafilatura not installed - install with: pip install trafilatura")
+    logger.warning("trafilatura not installed")
 
-app = FastAPI(
-    title="AI Search API", 
-    version="3.1", 
-    description="Reliable web search + content extraction for AI chat applications",
-    docs_url="/docs",
-    redoc_url="/redoc"
-)
+app = FastAPI(title="AI Search API", version="4.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["*"],
-)
+# ─── Cache ─────────────────────────────────────────────────────────
+_cache: Dict = {}
+CACHE_TTL = 300
 
-# ─────────────────────────────────────────────────────────────
-# CACHE SYSTEM
-# ─────────────────────────────────────────────────────────────
-_cache: Dict[str, Dict] = {}
-CACHE_TTL = 300  # 5 minutes
+def _cache_key(*args) -> str:
+    return hashlib.md5("|".join(str(a) for a in args).encode()).hexdigest()
 
-def _cache_key(*parts: Any) -> str:
-    key_str = "|".join(str(p) for p in parts if p is not None)
-    return hashlib.sha256(key_str.encode()).hexdigest()[:32]
-
-def cache_get(key: str) -> Optional[Dict]:
+def _cache_get(key: str):
     entry = _cache.get(key)
     if entry and (time.time() - entry["ts"]) < CACHE_TTL:
         return entry["data"]
     return None
 
-def cache_set(key: str, data: Dict):
+def _cache_set(key: str, data):
     _cache[key] = {"data": data, "ts": time.time()}
-    if len(_cache) > 100:
-        oldest = min(_cache.items(), key=lambda x: x[1]["ts"])
-        del _cache[oldest[0]]
 
-# ─────────────────────────────────────────────────────────────
-# HTTP CLIENT WITH ANTI-BOT EVASION
-# ─────────────────────────────────────────────────────────────
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/123.0.0.0 Safari/537.36",
-]
-_UA_INDEX = 0
+# ─── HTTP Client - ROBUST ENCODING ────────────────────────────────
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36"
 
-def _rotate_ua() -> str:
-    global _UA_INDEX
-    ua = USER_AGENTS[_UA_INDEX % len(USER_AGENTS)]
-    _UA_INDEX += 1
-    return ua
-
-def _get_headers(referer: Optional[str] = None, json_accept: bool = False) -> Dict[str, str]:
+async def fetch_html(url: str, post_data: dict = None, timeout: float = 15.0) -> Optional[str]:
+    """Fetch URL and return properly decoded HTML string"""
     headers = {
-        "User-Agent": _rotate_ua(),
-        "Accept": "application/json" if json_accept else "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "User-Agent": USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",  # Critical for proper decompression
-        "DNT": "1", "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-        "Sec-Fetch-Dest": "document" if not json_accept else "empty",
-        "Sec-Fetch-Mode": "navigate" if not json_accept else "cors",
-        "Sec-Fetch-Site": "none",
-        "Cache-Control": "no-cache", "Pragma": "no-cache",
+        "Accept-Encoding": "gzip, deflate",  # No 'br' for better compatibility
+        "DNT": "1",
     }
-    if referer: headers["Referer"] = referer
-    return headers
-
-async def _fetch_with_retry(
-    url: str, 
-    method: str = "GET", 
-    data: Optional[Dict] = None,
-    json_accept: bool = False,
-    referer: Optional[str] = None,
-    timeout: float = 20.0,
-    max_retries: int = 2
-) -> Optional[httpx.Response]:
-    """Fetch with retry logic and anti-bot evasion"""
-    headers = _get_headers(referer, json_accept)
     
-    for attempt in range(max_retries + 1):
-        try:
-            if attempt > 0:
-                await asyncio.sleep(0.5 * attempt)
-                
-            async with httpx.AsyncClient(
-                timeout=timeout,
-                follow_redirects=True,
-                headers=headers,
-                http2=False,  # Render-friendly
-            ) as client:
-                if method == "POST":
-                    r = await client.post(url, data=data or {})
-                else:
-                    r = await client.get(url)
-                
-                # Detect anti-bot responses
-                text_lower = r.text.lower()
-                if r.status_code == 403 or any(x in text_lower for x in [
-                    "just a moment", "checking your browser", "cloudflare",
-                    "access denied", "captcha", "ray id"
-                ]):
-                    if attempt < max_retries:
-                        continue
-                    return None
-                    
-                r.raise_for_status()
-                return r
-                
-        except Exception:
-            if attempt == max_retries:
+    try:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, http2=False) as client:
+            if post_data:
+                response = await client.post(url, data=post_data, headers=headers)
+            else:
+                response = await client.get(url, headers=headers)
+            
+            if response.status_code != 200:
                 return None
-            await asyncio.sleep(0.5)
-    
-    return None
-
-# ─────────────────────────────────────────────────────────────
-# FINANCIAL DATA DETECTION (for gold price, stock queries, etc.)
-# ─────────────────────────────────────────────────────────────
-FINANCIAL_KEYWORDS = [
-    "gold price", "silver price", "stock price", "bitcoin price", "crypto price",
-    "exchange rate", "currency", "forex", "metal price", "commodity price",
-    "gold rate", "silver rate", "btc", "eth", "usd", "eur", "gbp"
-]
-
-def _is_financial_query(query: str) -> bool:
-    """Detect if query is about financial/pricing data"""
-    q_lower = query.lower()
-    return any(kw in q_lower for kw in FINANCIAL_KEYWORDS)
-
-async def _fetch_financial_data(query: str) -> Optional[Dict]:
-    """Special handler for financial queries - scrape trusted sources"""
-    sources = [
-        ("https://goldprice.org/", ["gold", "silver", "metal", "price", "rate"]),
-        ("https://pricegold.net/", ["gold", "price", "rate"]),
-        ("https://www.livepriceofgold.com/", ["gold", "live", "price"]),
-    ]
-    
-    q_lower = query.lower()
-    for url, keywords in sources:
-        if any(kw in q_lower for kw in keywords):
+            
+            # 🔥 CRITICAL FIX: Force proper UTF-8 decoding
+            # First try to get encoding from response headers
+            content_type = response.headers.get("content-type", "")
+            if "charset=" in content_type:
+                encoding = content_type.split("charset=")[-1].strip().lower()
+            else:
+                encoding = "utf-8"
+            
             try:
-                r = await _fetch_with_retry(url, timeout=15)
-                if not r:
-                    continue
-                    
-                soup = BeautifulSoup(r.text, "html.parser")
+                return response.content.decode(encoding, errors="replace")
+            except:
+                return response.text  # Fallback
                 
-                # Extract gold price patterns
-                price_patterns = [
-                    r'\$[\d,]+\.?\d*\s*(?:/?\s*(?:oz|ounce|gram|kg))?',
-                    r'[\d,]+\.?\d*\s*(?:USD|dollars?)',
-                ]
-                
-                # Look for price in common locations
-                price_text = None
-                for selector in [
-                    ".spot-price", ".price", "#gold-price", 
-                    "[data-price]", ".current-price", "strong", "b"
-                ]:
-                    el = soup.select_one(selector)
-                    if el:
-                        text = el.get_text(strip=True)
-                        if "$" in text or any(c.isdigit() for c in text):
-                            price_text = text
-                            break
-                
-                if price_text:
-                    # Clean and extract numeric value
-                    cleaned = re.sub(r'[^\d\.\,]', '', price_text.replace("$", ""))
-                    try:
-                        price_val = float(cleaned.replace(",", ""))
-                        return {
-                            "query": query,
-                            "source": url,
-                            "price": price_val,
-                            "currency": "USD",
-                            "unit": "per ounce",
-                            "timestamp": datetime.utcnow().isoformat(),
-                            "raw_text": price_text,
-                        }
-                    except ValueError:
-                        pass
-                        
-            except Exception:
-                continue
+    except Exception as e:
+        logger.warning(f"Fetch error for {url[:60]}: {type(e).__name__}")
+        return None
+
+# ─── Search Engines ───────────────────────────────────────────────
+
+async def search_duckduckgo(query: str, limit: int = 8) -> List[Dict]:
+    """DuckDuckGo HTML search"""
+    html = await fetch_html("https://html.duckduckgo.com/html/", {"q": query, "kl": "us-en"})
+    if not html:
+        return []
     
-    return None
-
-# ─────────────────────────────────────────────────────────────
-# SEARCH ENGINES - FIXED PARSERS
-# ─────────────────────────────────────────────────────────────
-
-async def _search_duckduckgo(query: str, limit: int = 8) -> List[Dict]:
-    """DuckDuckGo HTML search - robust parsing"""
-    url = "https://html.duckduckgo.com/html/"
-    params = {"q": query, "kl": "us-en"}
+    soup = BeautifulSoup(html, "html.parser")
     results = []
     
-    try:
-        r = await _fetch_with_retry(url, method="POST", data=params, timeout=15)
-        if not r:
-            return []
+    for link in soup.select("a.result__a, .result__a, .links_main a"):
+        href = link.get("href", "")
+        if "uddg=" in href:
+            qs = parse_qs(urlparse(href).query)
+            href = unquote(qs.get("uddg", [""])[0])
         
-        soup = BeautifulSoup(r.text, "html.parser")
+        if not href.startswith(("http://", "https://")):
+            continue
         
-        for item in soup.select(".result__a, a.result__a, .links_main a"):
-            href = item.get("href", "")
-            if "uddg=" in href:
-                qs = parse_qs(urlparse(href).query)
-                href = unquote(qs.get("uddg", [""])[0])
-            if not href or not href.startswith(("http://", "https://")):
-                continue
-            
-            title = item.get_text(strip=True)
-            if not title or len(title) < 5:
-                continue
-            
-            snippet = ""
-            parent = item.find_parent(".result, .web-result")
-            if parent:
-                snip = parent.select_one(".result__snippet")
-                if snip: snippet = snip.get_text(strip=True)
-            
-            results.append({
-                "title": title, "url": href, 
-                "snippet": snippet[:280], "source": "duckduckgo"
-            })
-            if len(results) >= limit:
-                break
-                
-        return results[:limit]
-    except Exception as e:
-        logger.warning(f"DDG error: {e}")
-        return []
+        title = link.get_text(strip=True)
+        if len(title) < 5:
+            continue
+        
+        snippet = ""
+        parent = link.find_parent("div", class_=re.compile("result"))
+        if parent:
+            snip_el = parent.select_one(".result__snippet")
+            if snip_el:
+                snippet = snip_el.get_text(strip=True)
+        
+        results.append({
+            "title": title,
+            "url": href,
+            "snippet": snippet[:300],
+            "source": "duckduckgo"
+        })
+        
+        if len(results) >= limit:
+            break
+    
+    return results
 
-
-async def _search_hackernews(query: str, limit: int = 8) -> List[Dict]:
-    """Hacker News via Algolia API - most reliable"""
+async def search_hackernews(query: str, limit: int = 8) -> List[Dict]:
+    """Hacker News via Algolia API"""
     url = f"https://hn.algolia.com/api/v1/search"
-    params = {
-        "query": query, "tags": "story",
-        "hitsPerPage": min(limit, 20),
-        "attributesToRetrieve": "title,url,objectID,points,num_comments",
-    }
+    params = {"query": query, "tags": "story", "hitsPerPage": limit}
     
     try:
-        r = await _fetch_with_retry(url, params=params, json_accept=True, timeout=12)
-        if not r:
-            return []
-        
-        data = r.json()
-        results = []
-        
-        for hit in data.get("hits", []):
-            title = hit.get("title", "")
-            if not title or len(title) < 3:
-                continue
-            story_url = hit.get("url") or f"https://news.ycombinator.com/item?id={hit.get('objectID')}"
-            results.append({
-                "title": title, "url": story_url,
-                "snippet": f"▲{hit.get('points', 0)} 💬{hit.get('num_comments', 0)}",
-                "source": "hackernews"
-            })
-            if len(results) >= limit:
-                break
-        return results[:limit]
+        async with httpx.AsyncClient(timeout=12) as client:
+            response = await client.get(url, params=params)
+            if response.status_code != 200:
+                return []
+            
+            data = response.json()
+            results = []
+            
+            for hit in data.get("hits", []):
+                title = hit.get("title", "")
+                if not title:
+                    continue
+                
+                url = hit.get("url") or f"https://news.ycombinator.com/item?id={hit.get('objectID')}"
+                
+                results.append({
+                    "title": title,
+                    "url": url,
+                    "snippet": f"▲{hit.get('points', 0)} 💬{hit.get('num_comments', 0)}",
+                    "source": "hackernews"
+                })
+            
+            return results[:limit]
+            
     except Exception as e:
         logger.warning(f"HN error: {e}")
         return []
 
-
-async def _search_wikipedia(query: str, limit: int = 3) -> List[Dict]:
-    """Wikipedia API - official endpoint"""
+async def search_wikipedia(query: str, limit: int = 3) -> List[Dict]:
+    """Wikipedia API search"""
     url = "https://en.wikipedia.org/w/api.php"
     params = {
-        "action": "query", "list": "search", "srsearch": query,
-        "srlimit": limit, "format": "json", "origin": "*",
+        "action": "query",
+        "list": "search",
+        "srsearch": query,
+        "srlimit": limit,
+        "format": "json",
+        "origin": "*"
     }
-    headers = {"User-Agent": "AI-Search-API/3.1"}
+    headers = {"User-Agent": "AI-Search-API/4.0"}
     
     try:
         async with httpx.AsyncClient(timeout=12) as client:
-            r = await client.get(url, params=params, headers=headers)
-            r.raise_for_status()
-        
-        data = r.json()
-        results = []
-        
-        for item in data.get("query", {}).get("search", []):
-            title = item.get("title", "")
-            if not title:
-                continue
-            snippet = BeautifulSoup(item.get("snippet", ""), "html.parser").get_text(strip=True)
-            results.append({
-                "title": title,
-                "url": f"https://en.wikipedia.org/wiki/{title.replace(' ', '_')}",
-                "snippet": snippet[:280],
-                "source": "wikipedia"
-            })
-        return results[:limit]
+            response = await client.get(url, params=params, headers=headers)
+            if response.status_code != 200:
+                return []
+            
+            data = response.json()
+            results = []
+            
+            for item in data.get("query", {}).get("search", []):
+                title = item.get("title", "")
+                if not title:
+                    continue
+                
+                snippet = BeautifulSoup(item.get("snippet", ""), "html.parser").get_text(strip=True)
+                
+                results.append({
+                    "title": title,
+                    "url": f"https://en.wikipedia.org/wiki/{title.replace(' ', '_')}",
+                    "snippet": snippet[:300],
+                    "source": "wikipedia"
+                })
+            
+            return results
+            
     except Exception as e:
         logger.warning(f"Wikipedia error: {e}")
         return []
 
-
-async def _search_reddit(query: str, limit: int = 5) -> List[Dict]:
-    """Reddit JSON API - requires proper UA"""
-    url = f"https://www.reddit.com/search.json"
-    params = {"q": query, "sort": "relevance", "limit": min(limit, 25)}
-    headers = {
-        "User-Agent": "AI-Search-Bot/1.0 (by u/ai_helper; contact: api@example.com)",
-        "Accept": "application/json"
-    }
-    
-    try:
-        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-            r = await client.get(url, params=params, headers=headers)
-            if r.status_code == 429:
-                return []
-            r.raise_for_status()
-        
-        data = r.json()
-        results = []
-        
-        for post in data.get("data", {}).get("children", []):
-            d = post.get("data", {})
-            title, permalink = d.get("title", ""), d.get("permalink", "")
-            if not title or not permalink or len(title) < 3:
-                continue
-            text = d.get("selftext", "") or ("[Media post]" if d.get("is_video") else "")
-            results.append({
-                "title": title,
-                "url": f"https://reddit.com{permalink}",
-                "snippet": text[:280] if text else "",
-                "source": "reddit"
-            })
-            if len(results) >= limit:
-                break
-        return results[:limit]
-    except Exception as e:
-        logger.warning(f"Reddit error: {e}")
-        return []
-
-# ─────────────────────────────────────────────────────────────
-# CONTENT SCRAPING - FIXED ENCODING & ANTI-BOT
-# ─────────────────────────────────────────────────────────────
+# ─── Content Scraping - FIXED ─────────────────────────────────────
 
 async def scrape_content(url: str, max_chars: int = 3000) -> Dict[str, Any]:
-    """Extract main content with proper encoding handling"""
-    try:
-        parsed = urlparse(url)
-        if parsed.scheme not in ("http", "https"):
-            return _scrape_error(url, "invalid_scheme", "URL must start with http/https")
-    except Exception as e:
-        return _scrape_error(url, "parse_error", str(e)[:100])
+    """Extract main content with proper encoding"""
     
-    # Block anti-bot domains
-    if any(x in parsed.netloc.lower() for x in [
-        "cloudflare", "akamai", "incapsula", "perimeterx", "botprotect"
-    ]):
-        return _scrape_error(url, "blocked_domain", "Domain uses anti-bot protection")
+    # Validate URL
+    if not url.startswith(("http://", "https://")):
+        return {"url": url, "content": "", "method": "invalid", "ok": False}
     
-    # Fetch page
-    r = await _fetch_with_retry(url, timeout=25, max_retries=2)
-    if not r:
-        return _scrape_error(url, "fetch_failed", "Could not retrieve page")
+    # Skip known anti-bot domains
+    parsed = urlparse(url)
+    blocked = ["cloudflare", "akamai", "incapsula", "perimeterx", "captcha"]
+    if any(b in parsed.netloc.lower() for b in blocked):
+        return {"url": url, "content": "", "method": "blocked", "ok": False}
     
-    # Detect anti-bot pages
-    text_lower = r.text.lower()
-    if any(pat in text_lower for pat in [
-        "just a moment", "checking your browser", "cloudflare",
-        "access denied", "captcha", "ray id"
-    ]):
-        return _scrape_error(url, "antibot_detected", "Page requires JavaScript/CAPTCHA")
+    # Fetch HTML
+    html = await fetch_html(url, timeout=20.0)
+    if not html:
+        return {"url": url, "content": "", "method": "fetch_failed", "ok": False}
     
-    # CRITICAL: Get properly decoded text (httpx auto-handles gzip/br)
-    try:
-        html = r.text  # Auto-decoded with proper charset detection
-    except Exception as e:
-        return _scrape_error(url, "decode_error", f"Encoding issue: {str(e)[:80]}")
+    # Check for anti-bot pages
+    html_lower = html.lower()
+    if any(x in html_lower for x in ["just a moment", "checking your browser", "access denied", "captcha"]):
+        return {"url": url, "content": "", "method": "antibot", "ok": False}
     
     # Try trafilatura first
     if HAS_TRAFILATURA:
         try:
-            content = trafilatura.extract(
-                html, include_comments=False, include_tables=True,
-                favor_precision=True, no_fallback=False,
-            )
+            content = trafilatura.extract(html, include_comments=False, favor_precision=True)
             if content and len(content.strip()) > 100:
                 return {
-                    "url": url, "content": content[:max_chars],
-                    "method": "trafilatura", "ok": True, "char_count": len(content),
+                    "url": url,
+                    "content": content[:max_chars],
+                    "method": "trafilatura",
+                    "ok": True,
+                    "char_count": len(content)
                 }
-        except Exception:
+        except:
             pass
     
     # BeautifulSoup fallback
     try:
         soup = BeautifulSoup(html, "html.parser")
-        for tag in soup(["script", "style", "noscript", "nav", "footer", 
-                        "header", "aside", "iframe", "form"]):
+        
+        # Remove non-content elements
+        for tag in soup(["script", "style", "nav", "footer", "header", "aside", "iframe", "form"]):
             tag.decompose()
         
         # Find main content
         container = None
-        for selector in [
-            "article", "main", "[role='main']", "#content", ".content",
-            "[itemprop='articleBody']", ".post-content", ".entry-content", "body"
-        ]:
+        for selector in ["article", "main", '[role="main"]', "#content", ".content", ".post-content", "body"]:
             el = soup.select_one(selector)
             if el and len(el.get_text(strip=True)) > 150:
                 container = el
                 break
+        
         if not container:
             container = soup
         
         # Extract paragraphs
-        paragraphs = [
-            p.get_text(strip=True) for p in container.find_all("p")
-            if len(p.get_text(strip=True)) > 60
-            and not p.get_text(strip=True).startswith(("©", "Privacy", "Terms"))
-        ]
+        paragraphs = []
+        for p in container.find_all("p"):
+            text = p.get_text(strip=True)
+            if len(text) > 60 and not text.startswith(("©", "Privacy", "Terms", "Cookie")):
+                paragraphs.append(text)
         
-        content = "\n\n".join(paragraphs) if paragraphs else container.get_text(separator="\n", strip=True)
+        if paragraphs:
+            content = "\n\n".join(paragraphs)
+        else:
+            content = container.get_text(separator="\n", strip=True)
+        
+        # Clean up
         content = re.sub(r'\n{3,}', '\n\n', content).strip()
+        content = re.sub(r'[ \t]+', ' ', content)
         
-        if not content or len(content) < 50:
-            return _scrape_error(url, "no_content", "Could not extract meaningful text")
+        if len(content) < 50:
+            return {"url": url, "content": "", "method": "empty", "ok": False}
         
         return {
-            "url": url, "content": content[:max_chars],
-            "method": "beautifulsoup", "ok": True, "char_count": len(content),
+            "url": url,
+            "content": content[:max_chars],
+            "method": "beautifulsoup",
+            "ok": True,
+            "char_count": len(content)
         }
+        
     except Exception as e:
-        logger.warning(f"BS4 scrape failed: {e}")
-        return _scrape_error(url, "parse_failed", str(e)[:100])
+        return {"url": url, "content": "", "method": "error", "ok": False, "error": str(e)[:100]}
 
+# ─── Financial Data ──────────────────────────────────────────────
 
-def _scrape_error(url: str, method: str, message: str) -> Dict[str, Any]:
-    return {
-        "url": url, "content": "", "method": method,
-        "ok": False, "error": message, "char_count": 0,
-    }
+FINANCIAL_KEYWORDS = ["gold", "silver", "stock", "bitcoin", "crypto", "price", "rate", "usd", "eur"]
 
-# ─────────────────────────────────────────────────────────────
-# UTILITIES
-# ─────────────────────────────────────────────────────────────
+def is_financial_query(query: str) -> bool:
+    q = query.lower()
+    return any(kw in q for kw in FINANCIAL_KEYWORDS)
 
-def _deduplicate(results: List[Dict]) -> List[Dict]:
-    seen, unique = set(), []
+async def fetch_gold_price() -> Optional[Dict]:
+    """Fetch current gold price from goldprice.org"""
+    html = await fetch_html("https://goldprice.org/", timeout=15.0)
+    if not html:
+        return None
+    
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        
+        # Look for price in common locations
+        for selector in [".spot-price", ".price", "#gold-price", '[data-price]', "strong", "b"]:
+            el = soup.select_one(selector)
+            if el:
+                text = el.get_text(strip=True)
+                if "$" in text:
+                    # Extract number
+                    import re
+                    numbers = re.findall(r'[\d,]+\.?\d*', text.replace(",", ""))
+                    if numbers:
+                        price = float(numbers[0].replace(",", ""))
+                        return {
+                            "query": "gold price",
+                            "source": "https://goldprice.org/",
+                            "price": price,
+                            "currency": "USD",
+                            "unit": "per ounce",
+                            "timestamp": datetime.utcnow().isoformat(),
+                            "raw_text": text
+                        }
+    except:
+        pass
+    
+    return None
+
+# ─── Utilities ──────────────────────────────────────────────────
+
+def deduplicate_results(results: List[Dict]) -> List[Dict]:
+    seen = set()
+    unique = []
     for r in results:
         if not isinstance(r, dict) or not r.get("url") or not r.get("title"):
             continue
@@ -498,8 +355,7 @@ def _deduplicate(results: List[Dict]) -> List[Dict]:
             unique.append(r)
     return unique
 
-
-def _ensure_result_structure(r: Dict) -> Dict:
+def safe_result(r: Dict) -> Dict:
     return {
         "title": str(r.get("title", ""))[:200],
         "url": str(r.get("url", ""))[:500],
@@ -507,161 +363,191 @@ def _ensure_result_structure(r: Dict) -> Dict:
         "source": str(r.get("source", "unknown")),
         "content": r.get("content", ""),
         "scrape_ok": r.get("scrape_ok", False),
-        "scrape_method": r.get("scrape_method", "none"),
+        "scrape_method": r.get("scrape_method", "none")
     }
 
-# ─────────────────────────────────────────────────────────────
-# API ENDPOINTS
-# ─────────────────────────────────────────────────────────────
+# ─── API Endpoints ──────────────────────────────────────────────
 
-@app.get("/", tags=["Meta"])
-def api_root():
+@app.get("/")
+def root():
     return {
-        "name": "AI Search API", "version": "3.1", "status": "operational",
-        "usage": {
-            "quick": "/quick?query=...&max_results=5",
-            "full": "/search?query=...&engines=hn,ddg,wiki&scrape=true",
-            "scrape": "/scrape?url=https://example.com",
-            "financial": "/search?query=gold+price (auto-detects financial data)",
-        },
-        "engines": ["hn", "ddg", "wiki", "reddit"],
+        "name": "AI Search API",
+        "version": "4.0",
+        "status": "operational",
+        "endpoints": {
+            "/search": "Full search with optional scraping",
+            "/quick": "Fast metadata-only search",
+            "/scrape": "Scrape single URL",
+            "/health": "Health check"
+        }
     }
 
-
-@app.get("/health", tags=["Meta"])
-def health_check():
+@app.get("/health")
+def health():
     return {
-        "status": "ok", "version": "3.1",
+        "status": "ok",
+        "version": "4.0",
         "cache_entries": len(_cache),
         "trafilatura": HAS_TRAFILATURA,
-        "timestamp": time.time(),
+        "timestamp": time.time()
     }
 
-
-@app.get("/quick", tags=["Search"])
+@app.get("/quick")
 async def quick_search(
     query: str = Query(..., min_length=1, max_length=200),
-    max_results: int = Query(5, ge=1, le=20),
+    max_results: int = Query(5, ge=1, le=20)
 ):
-    """Fast search without scraping"""
-    cache_k = _cache_key("quick", query, max_results)
-    cached = cache_get(cache_k)
+    """Fast search without content scraping"""
+    
+    # Clamp max_results
+    max_results = min(max(1, max_results), 20)
+    
+    cache_key = _cache_key("quick", query, max_results)
+    cached = _cache_get(cache_key)
     if cached:
         return {**cached, "cached": True}
     
-    tasks = [_search_hackernews(query, max_results), _search_duckduckgo(query, max_results)]
+    # Run searches in parallel
+    tasks = [
+        search_hackernews(query, max_results),
+        search_duckduckgo(query, max_results),
+        search_wikipedia(query, min(3, max_results))
+    ]
+    
     batches = await asyncio.gather(*tasks, return_exceptions=True)
     
-    merged = [r for batch in batches if isinstance(batch, list) for r in batch]
-    results = _deduplicate(merged)[:max_results]
-    results = [_ensure_result_structure(r) for r in results]
+    # Merge results
+    merged = []
+    for batch in batches:
+        if isinstance(batch, list):
+            merged.extend(batch)
     
-    response = {"query": query, "total": len(results), "results": results, "cached": False}
-    cache_set(cache_k, response)
+    results = deduplicate_results(merged)[:max_results]
+    results = [safe_result(r) for r in results]
+    
+    response = {
+        "query": query,
+        "total": len(results),
+        "results": results,
+        "cached": False
+    }
+    
+    _cache_set(cache_key, response)
     return response
 
-
-@app.get("/search", tags=["Search"])
+@app.get("/search")
 async def full_search(
     query: str = Query(..., min_length=1, max_length=200),
     max_results: int = Query(5, ge=1, le=15),
     engines: str = Query("hn,ddg,wiki"),
     scrape: bool = Query(True),
-    max_chars: int = Query(2000, ge=300, le=5000),
+    max_chars: int = Query(2000, ge=300, le=5000)
 ):
-    """
-    Multi-engine search with optional scraping.
+    """Full search with optional content scraping"""
     
-    🎯 For financial queries (gold price, stock, crypto):
-    - Auto-detects and fetches structured price data
-    - Returns price + source + timestamp in results
-    """
-    cache_k = _cache_key("search", query, max_results, engines, scrape, max_chars)
-    cached = cache_get(cache_k)
+    # Clamp max_results
+    max_results = min(max(1, max_results), 15)
+    
+    cache_key = _cache_key("search", query, max_results, engines, scrape, max_chars)
+    cached = _cache_get(cache_key)
     if cached:
         return {**cached, "cached": True}
     
-    # 🎯 SPECIAL: Handle financial queries
-    financial_data = None
-    if _is_financial_query(query):
-        financial_data = await _fetch_financial_data(query)
+    # Parse engines
+    engine_list = [e.strip().lower() for e in engines.split(",") if e.strip()]
+    if not engine_list:
+        engine_list = ["hn", "ddg", "wiki"]
     
-    engine_codes = [e.strip().lower() for e in engines.split(",") if e.strip()] or ["hn", "ddg"]
-    engine_funcs = {
-        "hn": (_search_hackernews, 8), "ddg": (_search_duckduckgo, 8),
-        "wiki": (_search_wikipedia, 3), "reddit": (_search_reddit, 5),
+    engine_map = {
+        "hn": search_hackernews,
+        "ddg": search_duckduckgo,
+        "wiki": search_wikipedia
     }
     
+    # Build tasks
     tasks = []
     active_engines = []
-    for code in engine_codes:
-        if code in engine_funcs:
-            func, limit = engine_funcs[code]
-            tasks.append(func(query, min(limit, max_results)))
-            active_engines.append(code)
+    for eng in engine_list:
+        if eng in engine_map:
+            limit = min(8 if eng != "wiki" else 3, max_results)
+            tasks.append(engine_map[eng](query, limit))
+            active_engines.append(eng)
     
+    # Execute searches
     batches = await asyncio.gather(*tasks, return_exceptions=True)
-    merged = [r for batch in batches if isinstance(batch, list) for r in batch]
-    results = _deduplicate(merged)[:max_results]
     
-    # Scrape if requested
+    # Merge results
+    merged = []
+    for batch in batches:
+        if isinstance(batch, list):
+            merged.extend(batch)
+    
+    results = deduplicate_results(merged)[:max_results]
+    
+    # Check for financial data
+    financial_data = None
+    if is_financial_query(query) and "gold" in query.lower():
+        financial_data = await fetch_gold_price()
+    
+    # Scrape content if requested
     if scrape and results:
         scrape_tasks = [scrape_content(r["url"], max_chars) for r in results]
         scraped = await asyncio.gather(*scrape_tasks, return_exceptions=True)
-        for i, result in enumerate(results):
-            scrape_data = scraped[i] if i < len(scraped) and isinstance(scraped[i], dict) else {}
-            result["content"] = scrape_data.get("content", "") if scrape_data.get("ok") else ""
-            result["scrape_ok"] = scrape_data.get("ok", False)
-            result["scrape_method"] = scrape_data.get("method", "none")
+        
+        for i, r in enumerate(results):
+            s = scraped[i] if i < len(scraped) and isinstance(scraped[i], dict) else {}
+            r["content"] = s.get("content", "") if s.get("ok") else ""
+            r["scrape_ok"] = s.get("ok", False)
+            r["scrape_method"] = s.get("method", "none")
     
-    results = [_ensure_result_structure(r) for r in results]
+    results = [safe_result(r) for r in results]
     
-    # 🎯 Inject financial data if found
+    # Add financial data if found
     if financial_data:
         results.insert(0, {
-            "title": f"Current {query} - Live Data",
+            "title": f"Current Gold Price - Live",
             "url": financial_data.get("source", ""),
-            "snippet": f"Price: ${financial_data.get('price'):,.2f} {financial_data.get('unit', '')}",
+            "snippet": f"${financial_data.get('price', 0):,.2f} {financial_data.get('unit', '')}",
             "source": "financial_data",
             "content": json.dumps(financial_data, indent=2),
             "scrape_ok": True,
             "scrape_method": "financial_api",
-            "financial_data": financial_data,  # Structured price info
+            "financial_data": financial_data
         })
     
     response = {
-        "query": query, "total": len(results), "results": results,
-        "cached": False, "engines_used": active_engines,
-        "financial_query": _is_financial_query(query),
-        "scraped": scrape and any(r.get("scrape_ok") for r in results),
+        "query": query,
+        "total": len(results),
+        "results": results,
+        "cached": False,
+        "engines_used": active_engines,
+        "scraped": scrape and any(r.get("scrape_ok") for r in results)
     }
-    cache_set(cache_k, response)
+    
+    _cache_set(cache_key, response)
     return response
 
-
-@app.get("/scrape", tags=["Scraping"])
+@app.get("/scrape")
 async def scrape_single(
-    url: str = Query(...),
-    max_chars: int = Query(3000, ge=300, le=8000),
+    url: str = Query(..., description="URL to scrape"),
+    max_chars: int = Query(3000, ge=300, le=8000)
 ):
-    """Extract content from single URL"""
-    if not url.startswith(("http://", "https://")):
-        return JSONResponse(status_code=400, content={"error": "http/https required"})
+    """Scrape a single URL"""
     
-    cache_k = _cache_key("scrape", url, max_chars)
-    cached = cache_get(cache_k)
+    if not url.startswith(("http://", "https://")):
+        return JSONResponse(status_code=400, content={"error": "URL must start with http:// or https://"})
+    
+    cache_key = _cache_key("scrape", url, max_chars)
+    cached = _cache_get(cache_key)
     if cached:
         return {**cached, "cached": True}
     
     result = await scrape_content(url, max_chars)
-    cache_set(cache_k, result)
+    _cache_set(cache_key, result)
     return result
 
-# ─────────────────────────────────────────────────────────────
-# ERROR HANDLING
-# ─────────────────────────────────────────────────────────────
-
+# Error handler
 @app.exception_handler(Exception)
-async def global_exception_handler(request, exc: Exception):
+async def error_handler(request, exc):
     logger.error(f"Unhandled error: {exc}", exc_info=True)
     return JSONResponse(status_code=500, content={"error": "Internal server error"})
